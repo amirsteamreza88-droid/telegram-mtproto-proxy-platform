@@ -92,15 +92,15 @@ build_release() {
   log "Installing npm dependencies (release $ts)" >&2
 
   if ! sudo -u mtpanel -H bash -c \
-    "cd '$rel' && npm ci --no-audit --no-fund --loglevel=error"; then
+  "cd '$rel' && npm ci --no-audit --no-fund --loglevel=error" >&2; then
     rm -rf "$rel"
     die "npm ci failed. Release was not created."
   fi
 
   log "Building application" >&2
 
-  if ! sudo -u mtpanel -H bash -c \
-    "set -a; . '$PANEL_ENV'; set +a; cd '$rel' && MTP_DISABLE_RUNTIME=1 npm run build"; then
+ if ! sudo -u mtpanel -H bash -c \
+  "set -a; . '$PANEL_ENV'; set +a; cd '$rel' && MTP_DISABLE_RUNTIME=1 npm run build" >&2; then
     rm -rf "$rel"
     die "Application build failed. Release was not created."
   fi
