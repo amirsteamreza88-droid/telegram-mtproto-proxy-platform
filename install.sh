@@ -151,10 +151,12 @@ SOURCE_DIR="$SRC_DIR"
 EOF
 
 log "Building and deploying the application"
-REL=$(build_release "$SRC_DIR")
-migrate_release "$REL"
-activate_release "$REL"
+
+REL=$(build_release "$SRC_DIR") || die "Application build failed. Installation aborted."
+migrate_release "$REL" || die "Database migration failed. Installation aborted."
+activate_release "$REL" || die "Failed to activate application release."
 prune_releases
+
 
 log "Configuring HTTPS"
 SSL_DIR=$ETC/ssl; install -d -m 0750 "$SSL_DIR"

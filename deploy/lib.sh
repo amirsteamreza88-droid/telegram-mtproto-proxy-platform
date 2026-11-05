@@ -65,21 +65,49 @@ health_wait() {
   return 1
 }
 
+
 # Build a new release from the source directory $1 as the mtpanel user.
 # Echoes the release directory path on success.
 build_release() {
   local src=$1 ts rel
+
   ts=$(date -u +%Y%m%d%H%M%S)
   rel=$RELEASES/$ts
+
   mkdir -p "$rel"
-  rsync -a --delete --exclude .git --exclude node_modules --exclude .next --exclude .data --exclude .env "$src"/ "$rel"/
+
+  if ! rsync -a --delete \
+    --exclude .git \
+    --exclude node_modules \
+    --exclude .next \
+    --exclude .data \
+    --exclude .env \
+    "$src"/ "$rel"/; then
+    rm -rf "$rel"
+    die "Failed to copy application source into release."
+  fi
+
   chown -R mtpanel:mtpanel "$rel"
+
   log "Installing npm dependencies (release $ts)" >&2
-  sudo -u mtpanel -H bash -c "cd '$rel' && npm ci --no-audit --no-fund --loglevel=error" >&2
+
+  if ! sudo -u mtpanel -H bash -c \
+    "cd '$rel' && npm ci --no-audit --no-fund --loglevel=error"; then
+    rm -rf "$rel"
+    die "npm ci failed. Release was not created."
+  fi
+
   log "Building application" >&2
-  sudo -u mtpanel -H bash -c "set -a; . '$PANEL_ENV'; set +a; cd '$rel' && MTP_DISABLE_RUNTIME=1 npm run build" >&2
+
+  if ! sudo -u mtpanel -H bash -c \
+    "set -a; . '$PANEL_ENV'; set +a; cd '$rel' && MTP_DISABLE_RUNTIME=1 npm run build"; then
+    rm -rf "$rel"
+    die "Application build failed. Release was not created."
+  fi
+
   echo "$rel"
 }
+
 
 migrate_release() {
   local rel=$1
