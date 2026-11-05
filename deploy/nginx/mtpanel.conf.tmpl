@@ -8,9 +8,8 @@ server {
 }
 
 server {
-    listen __PANEL_PORT__ ssl;
-    listen [::]:__PANEL_PORT__ ssl;
-    http2 on;
+    listen __PANEL_PORT__ ssl http2;
+    listen [::]:__PANEL_PORT__ ssl http2;
     server_name __SERVER_NAME__;
 
     ssl_certificate     __CERT__;
