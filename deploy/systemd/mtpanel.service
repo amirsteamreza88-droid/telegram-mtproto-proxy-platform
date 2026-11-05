@@ -1,0 +1,28 @@
+[Unit]
+Description=MTPanel management panel (Next.js backend, monitoring, CPU protection, jobs)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=mtpanel
+Group=mtpanel
+WorkingDirectory=/opt/mtpanel/current
+EnvironmentFile=/etc/mtpanel/panel.env
+ExecStart=/usr/bin/node /opt/mtpanel/current/node_modules/next/dist/bin/next start -H 127.0.0.1 -p ${PORT}
+Restart=always
+RestartSec=3
+# keep the panel responsive under load: it is never throttled by CPU protection
+CPUWeight=1000
+Nice=-5
+OOMScoreAdjust=-500
+ProtectHome=yes
+PrivateTmp=yes
+# NoNewPrivileges / ProtectSystem must stay off: the root helper is executed through
+# sudo from inside this unit and inherits its mount namespace; it needs to write
+# /etc/mtpanel/workers and /etc/ufw. Privilege is constrained by sudoers instead
+# (only /usr/local/sbin/mtpanel-helper may be run, with validated arguments).
+
+[Install]
+WantedBy=multi-user.target

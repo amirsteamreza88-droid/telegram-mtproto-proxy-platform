@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh Telegram proxy-secret and proxy-multi.conf
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mtpanel/update-telegram-config.sh

@@ -1,0 +1,13 @@
+[Unit]
+Description=MTPanel: restore per-worker traffic shaping and firewall rules at boot
+After=network-online.target ufw.service
+Wants=network-online.target
+Before=mtpanel.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/mtpanel-helper restore-all
+
+[Install]
+WantedBy=multi-user.target

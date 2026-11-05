@@ -1,0 +1,479 @@
+#!/bin/bash
+# MTPanel privileged host helper.
+# Installed root-owned at /usr/local/sbin/mtpanel-helper (0755). The panel user may run
+# ONLY this program via sudo (see /etc/sudoers.d/mtpanel). Every argument and every
+# stdin value is validated against strict patterns; nothing is ever passed to a shell.
+set -euo pipefail
+umask 077
+export PATH=${MTP_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export LC_ALL=C
+
+CONF_DIR=${MTP_CONF_DIR:-/etc/mtpanel/workers}
+NET_DIR=${MTP_NET_DIR:-/var/lib/mtpanel/net}
+NFT_TABLE=${MTP_NFT_TABLE:-mtpanel}
+UNIT_PREFIX=mtproxy@
+
+die() { echo "error: $*" >&2; exit 1; }
+valid_id()   { [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 30000 )) || die "invalid worker id"; }
+valid_port() { [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )) || die "invalid port"; }
+valid_uint() { [[ "${1:-}" =~ ^[0-9]{1,9}$ ]] || die "invalid number: ${1:-}"; }
+valid_hex32(){ [[ "${1:-}" =~ ^[0-9a-f]{32}$ ]] || die "invalid hex32"; }
+valid_domain(){ [[ "${1:-}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] && (( ${#1} <= 253 )) || die "invalid domain"; }
+valid_ipv4() {
+  [[ "${1:-}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || die "invalid ipv4"
+  for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || die "invalid ipv4"; done
+}
+unit() { echo "${UNIT_PREFIX}$1.service"; }
+iface() { ip -o -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+
+mkdir -p "$CONF_DIR" "$NET_DIR"
+
+# ---------------- config ----------------
+cmd_write_config() {
+  local id=$1; valid_id "$id"
+  local PORT="" STATS_PORT="" SECRET="" MODE="" DOMAIN="" TAG="" MAXCONN="" k v
+  while IFS='=' read -r k v || [[ -n "$k" ]]; do
+    [[ -z "$k" ]] && continue
+    case "$k" in
+      PORT) valid_port "$v"; PORT=$v ;;
+      STATS_PORT) valid_port "$v"; STATS_PORT=$v ;;
+      SECRET) valid_hex32 "$v"; SECRET=$v ;;
+      MODE) [[ "$v" =~ ^(classic|secure|faketls)$ ]] || die "invalid mode"; MODE=$v ;;
+      DOMAIN) [[ -z "$v" ]] || valid_domain "$v"; DOMAIN=$v ;;
+      TAG) [[ -z "$v" ]] || valid_hex32 "$v"; TAG=$v ;;
+      MAXCONN) valid_uint "$v"; MAXCONN=$v ;;
+      *) die "unknown key $k" ;;
+    esac
+  done
+  [[ -n "$PORT" && -n "$STATS_PORT" && -n "$SECRET" && -n "$MODE" ]] || die "incomplete config"
+  [[ "$MODE" != faketls || -n "$DOMAIN" ]] || die "faketls requires DOMAIN"
+  local f="$CONF_DIR/$id.env"
+  [[ -f "$f" ]] && cp -p "$f" "$f.prev"   # never overwrite a working config without backup
+  local tmp; tmp=$(mktemp "$CONF_DIR/.tmp.XXXXXX")
+  printf 'PORT=%s\nSTATS_PORT=%s\nSECRET=%s\nMODE=%s\nDOMAIN=%s\nTAG=%s\nMAXCONN=%s\n' "$PORT" "$STATS_PORT" "$SECRET" "$MODE" "$DOMAIN" "$TAG" "$MAXCONN" > "$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$f"
+  echo ok
+}
+
+# ---------------- traffic shaping (tc) ----------------
+# Every component reports its own status (ok | failed | skipped). A failure in one
+# component NEVER aborts the others and is NEVER hidden: the NETSTATUS line is always
+# printed and the exit code is 0 (all ok) / 3 (partial) / 1 (nothing applied).
+
+IF=""
+IFB_OK=0
+TC_V4=skipped; TC_V6=skipped; IFB_V4=skipped; IFB_V6=skipped
+
+ensure_tc_base() {
+  IF=$(iface)
+  if [[ -z "$IF" ]]; then return 1; fi
+  if ! tc qdisc show dev "$IF" 2>/dev/null | grep -q '^qdisc htb 1: root'; then
+    tc qdisc replace dev "$IF" root handle 1: htb default 9999 r2q 1000 || return 1
+    tc class replace dev "$IF" parent 1: classid 1:1 htb rate 100gbit || return 1
+    tc class replace dev "$IF" parent 1:1 classid 1:9999 htb rate 100gbit || return 1
+    tc qdisc replace dev "$IF" parent 1:9999 fq_codel || return 1
+  fi
+  tc qdisc show dev "$IF" 2>/dev/null | grep -q '^qdisc ingress ffff:' || tc qdisc add dev "$IF" handle ffff: ingress || return 1
+  # ifb is required for ingress (upload) shaping only; without it we continue and
+  # report ifb_* as failed instead of pretending upload limits work.
+  IFB_OK=0
+  modprobe ifb numifbs=1 2>/dev/null
+  if ! ip link show ifb0 >/dev/null 2>&1; then
+    ip link add ifb0 type ifb 2>/dev/null || return 0
+  fi
+  ip link set ifb0 up 2>/dev/null || return 0
+  if ! tc qdisc show dev ifb0 2>/dev/null | grep -q '^qdisc htb 1: root'; then
+    tc qdisc replace dev ifb0 root handle 1: htb default 9999 r2q 1000 || return 0
+    tc class replace dev ifb0 parent 1: classid 1:1 htb rate 100gbit || return 0
+    tc class replace dev ifb0 parent 1:1 classid 1:9999 htb rate 100gbit || return 0
+    tc qdisc replace dev ifb0 parent 1:9999 fq_codel || return 0
+  fi
+  IFB_OK=1
+  return 0
+}
+
+# Deletion is idempotent cleanup, NOT enforcement: a missing qdisc/filter/rule is
+# a normal outcome and must not abort the script (set -e). Enforcement paths
+# (tc_apply_worker / fw_apply_tool / nft_global_apply) report status separately.
+tc_clear_worker() {
+  local id=$1 dev p4=$((10#$id + 10)) p6=$((10#$id + 32000)) cls; cls=$(printf '%x' $((10#$id + 16)))
+  [[ -n "$IF" ]] || IF=$(iface)
+  for dev in "$IF" ifb0; do
+    tc filter del dev "$dev" parent 1: prio "$p4" 2>/dev/null || true
+    tc filter del dev "$dev" parent 1: prio "$p6" 2>/dev/null || true
+    tc class del dev "$dev" classid "1:$cls" 2>/dev/null || true
+  done
+  if [[ -n "$IF" ]]; then
+    tc filter del dev "$IF" parent ffff: prio "$p4" 2>/dev/null || true
+    tc filter del dev "$IF" parent ffff: prio "$p6" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Every worker gets its own HTB class (unlimited = 100gbit) so per-worker traffic is
+# always measurable. Matching is by the worker's listening port only, so limits never
+# touch other workers, SSH, the dashboard or the database.
+# Sets TC_V4/TC_V6 (egress = client download) and IFB_V4/IFB_V6 (ingress = client upload).
+tc_apply_worker() {
+  local id=$1 port=$2 down=$3 up=$4
+  local p4=$((10#$id + 10)) p6=$((10#$id + 32000)) cls; cls=$(printf '%x' $((10#$id + 16)))
+  local rd="100gbit" ru="100gbit"
+  (( down > 0 )) && rd="${down}kbit"
+  (( up > 0 )) && ru="${up}kbit"
+  TC_V4=skipped; TC_V6=skipped; IFB_V4=skipped; IFB_V6=skipped
+  if ! ensure_tc_base; then
+    [[ -z "$IF" ]] && { TC_V4=unavailable; TC_V6=unavailable; IFB_V4=unavailable; IFB_V6=unavailable; return 0; }
+    TC_V4=failed; TC_V6=failed; IFB_V4=failed; IFB_V6=failed; return 0
+  fi
+  # egress, IPv4 and IPv6 checked independently
+  if tc class replace dev "$IF" parent 1:1 classid "1:$cls" htb rate "$rd" ceil "$rd" 2>/dev/null \
+     && tc qdisc replace dev "$IF" parent "1:$cls" fq_codel 2>/dev/null; then TC_V4=ok; else TC_V4=failed; fi
+  if tc filter add dev "$IF" parent 1: protocol ip prio "$p4" u32 match ip sport "$port" 0xffff flowid "1:$cls" 2>/dev/null; then :; else TC_V4=failed; fi
+  if tc filter add dev "$IF" parent 1: protocol ipv6 prio "$p6" u32 match ip6 sport "$port" 0xffff flowid "1:$cls" 2>/dev/null; then TC_V6=ok; else TC_V6=failed; fi
+  # ingress (client upload) redirected to ifb0 only for this port
+  if [[ "$IFB_OK" == 1 ]]; then
+    if tc filter add dev "$IF" parent ffff: protocol ip prio "$p4" u32 match ip dport "$port" 0xffff action mirred egress redirect dev ifb0 2>/dev/null; then IFB_V4=ok; else IFB_V4=failed; fi
+    if tc class replace dev ifb0 parent 1:1 classid "1:$cls" htb rate "$ru" ceil "$ru" 2>/dev/null \
+       && tc qdisc replace dev ifb0 parent "1:$cls" fq_codel 2>/dev/null; then :; else IFB_V4=failed; fi
+    if tc filter add dev ifb0 parent 1: protocol ip prio "$p4" u32 match ip dport "$port" 0xffff flowid "1:$cls" 2>/dev/null; then :; else IFB_V4=failed; fi
+    if tc filter add dev "$IF" parent ffff: protocol ipv6 prio "$p6" u32 match ip6 dport "$port" 0xffff action mirred egress redirect dev ifb0 2>/dev/null; then IFB_V6=ok; else IFB_V6=failed; fi
+    if tc filter add dev ifb0 parent 1: protocol ipv6 prio "$p6" u32 match ip6 dport "$port" 0xffff flowid "1:$cls" 2>/dev/null; then :; else IFB_V6=failed; fi
+  else
+    IFB_V4=failed; IFB_V6=failed   # ifb unavailable: upload shaping NOT in effect, reported honestly
+  fi
+  return 0
+}
+
+# ---------------- global connection limit (nftables, inet family) ----------------
+# One rule per worker in `table inet` uses a SINGLE ct counter shared by IPv4 and
+# IPv6, so the TOTAL limit is a true global per-worker limit. Reapplying deletes the
+# old rule first (comment-based lookup), so rules are never duplicated. Failures are
+# returned, never swallowed: NFT_GLOBAL is ok | off | failed.
+NFT_GLOBAL=skipped
+
+nft_global_delete() {
+  local id=$1 h
+  # Delete every rule tagged with this worker's comment. If the table does not
+  # exist the list command simply outputs nothing and this is a no-op.
+  while read -r h; do
+    [[ -n "$h" ]] && nft delete rule inet "$NFT_TABLE" input handle "$h" 2>/dev/null || true
+  done < <(nft -a list chain inet "$NFT_TABLE" input 2>/dev/null | awk -v c="mtp-global-$id" 'index($0, "handle") && index($0, c) {for(i=1;i<=NF;i++) if($i=="handle") print $(i+1)}')
+  return 0
+}
+
+nft_global_apply() {
+  local id=$1 port=$2 total=$3
+  if (( total <= 0 )); then
+    nft_global_delete "$id"
+    NFT_GLOBAL=off
+    return 0
+  fi
+  if ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    nft add table inet "$NFT_TABLE" || { NFT_GLOBAL=failed; return 1; }
+  fi
+  if ! nft list chain inet "$NFT_TABLE" input >/dev/null 2>&1; then
+    nft add chain inet "$NFT_TABLE" input '{ type filter hook input priority filter; policy accept; }' || { NFT_GLOBAL=failed; return 1; }
+  fi
+  nft_global_delete "$id"   # idempotent: remove previous rule(s) for this worker first
+  # Preferred: one rule in family inet -> a SINGLE counter shared by IPv4 and IPv6.
+  if nft add rule inet "$NFT_TABLE" input meta l4proto tcp tcp dport "$port" ct state new ct count over "$total" counter drop comment "mtp-global-$id" 2>/dev/null; then
+    NFT_GLOBAL=ok
+    return 0
+  fi
+  # No named-counter fallback: on kernels without `ct count` we return failure and
+  # the caller falls back to per-family iptables connlimit (reported as such).
+  nft_global_delete "$id"
+  NFT_GLOBAL=failed
+  return 1
+}
+
+# ---------------- per-IP limits & IP blocks (iptables / ip6tables) ----------------
+# NOTE: connlimit counters are per address family by nature; the *global* TOTAL limit
+# above is the one shared across IPv4+IPv6. Statuses are reported per family.
+IP4_FW=skipped; IP6_FW=skipped
+
+fw_apply_tool() {
+  local tool=$1 id=$2 port=$3 perip=$4 blocks=$5 use_total=${6:-0} mask=32 st=ok
+  [[ "$tool" == ip6tables ]] && mask=128
+  local ch="MTPW$id"
+  $tool -w -N MTPANEL 2>/dev/null
+  $tool -w -C INPUT -j MTPANEL 2>/dev/null || $tool -w -I INPUT 1 -j MTPANEL 2>/dev/null || st=failed
+  $tool -w -N "$ch" 2>/dev/null || $tool -w -F "$ch" || st=failed
+  if [[ "$tool" == iptables && -n "$blocks" ]]; then
+    local ip; IFS=',' read -ra arr <<< "$blocks"
+    for ip in "${arr[@]}"; do
+      valid_ipv4 "$ip" || st=failed
+      $tool -w -A "$ch" -s "$ip" -m comment --comment mtp-block -j DROP 2>/dev/null || st=failed
+    done
+  fi
+  $tool -w -A "$ch" -p tcp -m conntrack --ctstate NEW -m comment --comment mtp-acct 2>/dev/null || st=failed
+  if (( perip > 0 )); then
+    $tool -w -A "$ch" -p tcp --syn -m connlimit --connlimit-above "$perip" --connlimit-mask "$mask" -m comment --comment mtp-perip -j REJECT --reject-with tcp-reset 2>/dev/null || st=failed
+  fi
+  if (( use_total > 0 )); then
+    # mask 0 groups ALL source addresses into one counter (per address family)
+    $tool -w -A "$ch" -p tcp --syn -m connlimit --connlimit-above "$use_total" --connlimit-mask 0 -m comment --comment mtp-total -j REJECT --reject-with tcp-reset 2>/dev/null || st=failed
+  fi
+  $tool -w -A "$ch" -j RETURN 2>/dev/null || st=failed
+  fw_unjump "$tool" "$id"
+  $tool -w -A MTPANEL -p tcp --dport "$port" -j "$ch" 2>/dev/null || st=failed
+  [[ "$st" == ok ]] && return 0
+  return 1
+}
+
+fw_unjump() {
+  local tool=$1 ch="MTPW$2" rule
+  while read -r rule; do
+    # shellcheck disable=SC2086
+    $tool -w $rule 2>/dev/null
+  done < <($tool -w -S MTPANEL 2>/dev/null | grep -E -- "-j $ch\$" | sed 's/^-A /-D /')
+  return 0
+}
+
+fw_clear_worker() {
+  local id=$1
+  for tool in iptables ip6tables; do
+    fw_unjump "$tool" "$id"
+    $tool -w -F "MTPW$id" 2>/dev/null || true
+    $tool -w -X "MTPW$id" 2>/dev/null || true
+  done
+  nft_global_delete "$id"
+  return 0
+}
+
+ufw_sync() {
+  local id=$1 old=$2 new=$3
+  command -v ufw >/dev/null || return 0
+  ufw status 2>/dev/null | grep -q '^Status: active' || return 0
+  if [[ -n "$old" && "$old" != "$new" ]]; then ufw --force delete allow "$old/tcp" >/dev/null 2>&1; fi
+  if [[ -n "$new" ]]; then ufw allow "$new/tcp" comment "mtpanel-worker-$id" >/dev/null; fi
+  return 0
+}
+
+# Apply everything for one worker from its saved state; prints NETSTATUS; exit code
+# 0 = everything applied, 3 = partial, 1 = nothing applied.
+net_apply() {
+  local id=$1
+  local f="$NET_DIR/$1.net"
+  local PORT DOWN UP TOTAL PERIP BLOCKS
+  PORT=$(sed -n 's/^PORT=//p' "$f"); DOWN=$(sed -n 's/^DOWN=//p' "$f"); UP=$(sed -n 's/^UP=//p' "$f")
+  TOTAL=$(sed -n 's/^TOTAL=//p' "$f"); PERIP=$(sed -n 's/^PERIP=//p' "$f"); BLOCKS=$(sed -n 's/^BLOCKS=//p' "$f")
+  valid_port "$PORT"; valid_uint "${DOWN:-0}"; valid_uint "${UP:-0}"; valid_uint "${TOTAL:-0}"; valid_uint "${PERIP:-0}"
+  [[ -z "${BLOCKS:-}" ]] || { IFS=',' read -ra barr <<< "$BLOCKS"; for ip in "${barr[@]}"; do valid_ipv4 "$ip"; done; }
+
+  tc_apply_worker "$id" "$PORT" "${DOWN:-0}" "${UP:-0}"
+  if nft_global_apply "$id" "$PORT" "${TOTAL:-0}"; then :; fi
+  # If nftables could not install the shared counter, fall back to per-family
+  # iptables connlimit (mask 0 = one global group per family) and SAY SO.
+  local use_total=0
+  [[ "$NFT_GLOBAL" == failed ]] && use_total=${TOTAL:-0}
+  if (( use_total > 0 )); then
+    if fw_apply_tool iptables "$id" "$PORT" "${PERIP:-0}" "${BLOCKS:-}" "$use_total" && fw_apply_tool ip6tables "$id" "$PORT" "${PERIP:-0}" "" "$use_total"; then
+      NFT_GLOBAL=fallback-iptables-per-family
+    fi
+  else
+    fw_apply_tool iptables "$id" "$PORT" "${PERIP:-0}" "${BLOCKS:-}" 0 && IP4_FW=ok || IP4_FW=failed
+    fw_apply_tool ip6tables "$id" "$PORT" "${PERIP:-0}" "" 0 && IP6_FW=ok || IP6_FW=failed
+  fi
+  ufw_sync "$id" "" "$PORT"
+
+  local line="NETSTATUS id=$id port=$PORT tc_v4=$TC_V4 tc_v6=$TC_V6 ifb_v4=$IFB_V4 ifb_v6=$IFB_V6 nft_global=$NFT_GLOBAL ip4_fw=$IP4_FW ip6_fw=$IP6_FW"
+  echo "$line"
+  echo "$line" > "$NET_DIR/$id.status"
+  local failed=0 total=0
+  local v
+  for v in "$TC_V4" "$TC_V6" "$IFB_V4" "$IFB_V6" "$NFT_GLOBAL" "$IP4_FW" "$IP6_FW"; do
+    [[ "$v" == skipped ]] && continue
+    total=$((total+1))
+    # fallbacks enforce the limit but not as specified (shared v4/v6 counter):
+    # reported as partial, never as plain "ok"
+    [[ "$v" == ok || "$v" == off ]] || failed=$((failed+1))
+  done
+  if (( failed == 0 )); then return 0; fi
+  if (( failed >= total && total > 0 )); then return 1; fi
+  return 3
+}
+
+cmd_net_apply() {
+  local id=$1; valid_id "$id"
+  local PORT="" DOWN=0 UP=0 TOTAL=0 PERIP=0 BLOCKS="" k v
+  while IFS='=' read -r k v || [[ -n "$k" ]]; do
+    [[ -z "$k" ]] && continue
+    case "$k" in
+      PORT) valid_port "$v"; PORT=$v ;;
+      DOWN) valid_uint "$v"; DOWN=$v ;;
+      UP) valid_uint "$v"; UP=$v ;;
+      TOTAL) valid_uint "$v"; TOTAL=$v ;;
+      PERIP) valid_uint "$v"; PERIP=$v ;;
+      BLOCKS) if [[ -n "$v" ]]; then IFS=',' read -ra arr <<< "$v"; for ip in "${arr[@]}"; do valid_ipv4 "$ip"; done; fi; BLOCKS=$v ;;
+      *) die "unknown key $k" ;;
+    esac
+  done
+  [[ -n "$PORT" ]] || die "PORT required"
+  local f="$NET_DIR/$id.net" oldport=""
+  [[ -f "$f" ]] && oldport=$(sed -n 's/^PORT=//p' "$f")
+  printf 'PORT=%s\nDOWN=%s\nUP=%s\nTOTAL=%s\nPERIP=%s\nBLOCKS=%s\n' "$PORT" "$DOWN" "$UP" "$TOTAL" "$PERIP" "$BLOCKS" > "$f"
+  if [[ -n "$oldport" && "$oldport" != "$PORT" ]]; then tc_clear_worker "$id"; ufw_sync "$id" "$oldport" ""; fi
+  local rc=0
+  net_apply "$id" || rc=$?
+  exit "$rc"
+}
+
+# Boot-time restoration. Every worker's NETSTATUS line is preserved on stdout; the
+# summary line reports counts; the EXIT CODE tells systemd the truth:
+# 0 = all workers restored, 3 = partial, 1 = none/total failure. Retrying is safe:
+# net_apply deletes a worker's old rules before re-adding them (no duplicates).
+cmd_restore_all() {
+  local f id rc_all=0 rc n_ok=0 n_fail=0 n=0
+  for f in "$NET_DIR"/*.net; do
+    [[ -e "$f" ]] || continue
+    id=$(basename "$f" .net)
+    [[ "$id" =~ ^[0-9]{1,5}$ ]] || { echo "RESTORE_SKIP bad state file: $f" >&2; continue; }
+    n=$((n+1))
+    # subshell: a corrupt state file must not abort the other workers
+    if ( net_apply "$id" ); then
+      n_ok=$((n_ok+1))
+    else
+      rc=$?
+      n_fail=$((n_fail+1))
+      if (( rc > rc_all )); then rc_all=$rc; fi
+    fi
+  done
+  # summary exit code: 0 = all ok, 1 = nothing restored, 3 = partial
+  if (( n_fail == 0 )); then rc_all=0
+  elif (( n_ok == 0 )); then rc_all=1
+  else rc_all=3; fi
+  echo "RESTORE_DONE workers=$n ok=$n_ok failed=$n_fail exit=$rc_all"
+  exit "$rc_all"
+}
+
+cmd_stats() {
+  IF=$(iface)
+  [[ -n "$IF" ]] || exit 0
+  tc -s class show dev "$IF" 2>/dev/null | awk '/^class htb 1:/{split($3,a,":"); c=a[2]} /^ Sent/{ if(c!="" && c!="1" && c!="9999") print "tc egress", c, $2; c="" }'
+  tc -s class show dev ifb0 2>/dev/null | awk '/^class htb 1:/{split($3,a,":"); c=a[2]} /^ Sent/{ if(c!="" && c!="1" && c!="9999") print "tc ingress", c, $2; c="" }'
+  local ch
+  for ch in $(iptables -w -S 2>/dev/null | awk '/^-N MTPW[0-9]+$/{print $2}'); do
+    local n4 n6
+    n4=$(iptables -w -L "$ch" -v -x -n 2>/dev/null | awk '/mtp-acct/{print $1; exit}')
+    n6=$(ip6tables -w -L "$ch" -v -x -n 2>/dev/null | awk '/mtp-acct/{print $1; exit}')
+    echo "acct ${ch#MTPW} $(( ${n4:-0} + ${n6:-0} ))"
+  done
+  # global per-worker connection counters (shared IPv4+IPv6), for diagnostics
+  if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    nft list chain inet "$NFT_TABLE" input 2>/dev/null | grep -o 'comment "mtp-global-[0-9]*"' | sed 's/.*mtp-global-//;s/"//' | while read -r wid; do
+      local cnt; cnt=$(nft list chain inet "$NFT_TABLE" input 2>/dev/null | awk -v c="mtp-global-$wid" 'index($0,c) && /counter packets/{for(i=1;i<=NF;i++) if($i=="packets") print $(i+1)}')
+      [[ -n "$cnt" ]] && echo "global ${wid} ${cnt}"
+    done
+  fi
+  return 0
+}
+
+# ---------------- service lifecycle ----------------
+cmd_systemctl() {
+  local action=$1 id=$2; valid_id "$id"
+  [[ -f "$CONF_DIR/$id.env" ]] || [[ "$action" == stop || "$action" == disable ]] || die "worker $id has no configuration"
+  case "$action" in
+    start|stop|restart|enable|disable) systemctl "$action" "$(unit "$id")" ;;
+  esac
+  [[ "$action" == start || "$action" == restart ]] && systemctl reset-failed "$(unit "$id")" 2>/dev/null || true
+  echo ok
+}
+
+cmd_remove() {
+  local id=$1; valid_id "$id"
+  systemctl stop "$(unit "$id")" 2>/dev/null || true
+  systemctl disable "$(unit "$id")" 2>/dev/null || true
+  systemctl reset-failed "$(unit "$id")" 2>/dev/null || true
+  local oldport=""
+  if [[ -f "$NET_DIR/$id.net" ]]; then oldport=$(sed -n 's/^PORT=//p' "$NET_DIR/$id.net"); fi
+  tc_clear_worker "$id"
+  fw_clear_worker "$id"
+  if [[ -n "$oldport" ]]; then ufw_sync "$id" "$oldport" ""; fi
+  rm -f "$CONF_DIR/$id.env" "$CONF_DIR/$id.env.prev" "$NET_DIR/$id.net" "$NET_DIR/$id.status"
+  echo "REMOVED id=$id nft_rules_left=$(nft -a list chain inet "$NFT_TABLE" input 2>/dev/null | grep -c "mtp-global-$id" || true)"
+  echo ok
+}
+
+cmd_logs() {
+  local id=$1 n=$2; valid_id "$id"; valid_uint "$n"; (( n <= 2000 )) || n=2000
+  journalctl -u "$(unit "$id")" -n "$n" --no-pager -o short-iso 2>&1 || true
+}
+
+cmd_epoll() {
+  local id=$1; valid_id "$id"
+  local pid; pid=$(systemctl show -p MainPID --value "$(unit "$id")")
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" != 0 ]] || die "worker not running"
+  local count=0 p
+  for p in "$pid" $(pgrep -P "$pid" 2>/dev/null || true); do
+    local c; c=$(find "/proc/$p/fd" -maxdepth 1 -lname 'anon_inode:\[eventpoll\]' 2>/dev/null | wc -l)
+    count=$((count + c))
+  done
+  echo "$count"
+}
+
+cmd_cpuquota_check() {
+  local id=$1; valid_id "$id"
+  local q; q=$(systemctl show -p CPUQuota --value "$(unit "$id")" 2>/dev/null)
+  # empty or "infinity%" means no quota is set
+  if [[ -z "$q" || "$q" == "infinity%" || "$q" == "infinity" ]]; then echo off; else echo "$q"; fi
+}
+
+cmd_cpuquota() {
+  local id=$1 v=$2; valid_id "$id"
+  if [[ "$v" == off ]]; then
+    systemctl set-property --runtime "$(unit "$id")" CPUQuota=
+  else
+    valid_uint "$v"; (( v >= 1 && v <= 10000 )) || die "invalid quota"
+    systemctl set-property --runtime "$(unit "$id")" "CPUQuota=${v}%"
+  fi
+  echo ok
+}
+
+cmd_list() {
+  local f
+  for f in "$CONF_DIR"/*.env; do [[ -e "$f" ]] && basename "$f" .env; done
+  return 0
+}
+
+cmd_doctor() {
+  ok()   { echo "OK   $1: $2"; }
+  fail() { echo "FAIL $1: $2"; }
+  warn() { echo "WARN $1: $2"; }
+  [[ -x /opt/mtproxy/mtproto-proxy ]] && ok "MTProxy binary" "/opt/mtproxy/mtproto-proxy" || fail "MTProxy binary" "missing (re-run install.sh)"
+  for f in proxy-secret proxy-multi.conf; do
+    if [[ -s /var/lib/mtproxy/$f ]]; then
+      local age=$(( ( $(date +%s) - $(stat -c %Y /var/lib/mtproxy/$f) ) / 3600 ))
+      (( age < 72 )) && ok "Telegram $f" "updated ${age}h ago" || warn "Telegram $f" "${age}h old (refresh timer: mtproxy-config-update.timer)"
+    else fail "Telegram $f" "missing"; fi
+  done
+  systemctl is-active --quiet mtproxy-config-update.timer && ok "Config refresh timer" "active" || warn "Config refresh timer" "inactive"
+  local pm; pm=$(cat /proc/sys/kernel/pid_max)
+  (( pm <= 65535 )) && ok "kernel.pid_max" "$pm (MTProxy compatible)" || warn "kernel.pid_max" "$pm > 65535 – official MTProxy may crash on large PIDs"
+  IF=$(iface); [[ -n "$IF" ]] && ok "Default interface" "$IF" || fail "Default interface" "not found"
+  modprobe -n ifb 2>/dev/null && ok "ifb module" "available" || fail "ifb module" "unavailable – upload limits cannot work"
+  iptables -w -L MTPANEL -n >/dev/null 2>&1 && ok "iptables MTPANEL chain" "present" || warn "iptables MTPANEL chain" "not created yet (created with first worker)"
+  systemctl is-active --quiet nginx && ok "nginx" "active" || fail "nginx" "inactive"
+  systemctl is-active --quiet postgresql && ok "PostgreSQL" "active" || fail "PostgreSQL" "inactive"
+  systemctl is-active --quiet mtpanel-netrules && ok "Boot network-rules restore" "done" || warn "Boot network-rules restore" "not active"
+  if command -v ufw >/dev/null; then ufw status | grep -q '^Status: active' && ok "UFW firewall" "active" || warn "UFW firewall" "inactive"; fi
+  ss -Htln 'sport = :5432' | grep -qv '127.0.0.1\|\[::1\]' && fail "PostgreSQL exposure" "listening on non-loopback address" || ok "PostgreSQL exposure" "loopback only"
+}
+
+action=${1:-}; shift || true
+case "$action" in
+  ping) echo pong ;;
+  write-config) cmd_write_config "${1:-}" ;;
+  start|stop|restart|enable|disable) cmd_systemctl "$action" "${1:-}" ;;
+  remove) cmd_remove "${1:-}" ;;
+  logs) cmd_logs "${1:-}" "${2:-200}" ;;
+  epoll) cmd_epoll "${1:-}" ;;
+  cpuquota) cmd_cpuquota "${1:-}" "${2:-}" ;;
+  cpuquota-check) cmd_cpuquota_check "${1:-}" ;;
+  net-apply) cmd_net_apply "${1:-}" ;;
+  restore-all) cmd_restore_all ;;
+  stats) cmd_stats ;;
+  list) cmd_list ;;
+  doctor) cmd_doctor ;;
+  *) die "unknown action" ;;
+esac
